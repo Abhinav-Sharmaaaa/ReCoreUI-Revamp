@@ -25,10 +25,10 @@ BPROP "vendor" "ro.adb.secure" "0"
 ROM_BUILD_ID="$(GET_PROP "system" "ro.build.display.id")"
 
 
-if [[ "$ROM_BUILD_ID" == *ReCoreUI* ]]; then
+if [[ "$ROM_BUILD_ID" == *ReCoreUI* || "$ROM_BUILD_ID" == *"${ROM_NAME:-ReCoreUI}"* ]]; then
     RECOREUI_PROP="$ROM_BUILD_ID"
 else
-    RECOREUI_PROP="ReCoreUI ${ROM_VERSION} [${ROM_BUILD_ID}]"
+    RECOREUI_PROP="${ROM_NAME:-ReCoreUI} ${ROM_VERSION} [${ROM_BUILD_ID}]"
 fi
 
 BPROP "system" "ro.build.display.id" "$RECOREUI_PROP"					  

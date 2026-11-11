@@ -20,7 +20,8 @@ set -o pipefail
 RECOREUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export RECOREUI
 
-ROM_VERSION="8.6"
+ROM_NAME="ReCore-Revamp"
+ROM_VERSION="8.5"
 
 BETA_ASSERT=0
 BETA_OTA_URL=""
