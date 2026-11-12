@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       device:
-        description: 'Choose objective'
+        description: 'Objective, or several separated by commas (e.g. a14x,a146m,m14x,f14x). Built one after another.'
         required: true
         default: 'a14x'
       upload_cloud:
@@ -25,8 +25,6 @@ on:
         type: choice
         options:
           - none
-          - hfp_sw
-          - sco_noenh
           - no_bt_patch
           - no_spoof
           - bt_diag
@@ -39,8 +37,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-24.04
+    outputs:
+      devices: ${{ steps.list.outputs.devices }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build device list
+        id: list
+        env:
+          DEVICES: ${{ inputs.device }}
+        run: |
+          set -euo pipefail
+          LIST=()
+          IFS=',' read -ra RAW <<< "$DEVICES"
+          for D in "${RAW[@]}"; do
+            D="$(echo "$D" | tr -d '[:space:]')"
+            [[ -z "$D" ]] && continue
+            if [[ ! "$D" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              echo "Invalid device name: $D"; exit 1
+            fi
+            if [[ ! -d "objectives/$D" ]]; then
+              echo "No objectives/$D folder in this repo"; exit 1
+            fi
+            LIST+=("$D")
+          done
+          [[ ${#LIST[@]} -gt 0 ]] || { echo "No device given"; exit 1; }
+          JSON=$(printf '%s\n' "${LIST[@]}" | jq -R . | jq -sc .)
+          echo "Devices: $JSON"
+          echo "devices=$JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        device: ${{ fromJSON(needs.prepare.outputs.devices) }}
 
     steps:
       - name: Checkout Repository
@@ -76,7 +112,7 @@ jobs:
 
       - name: Run ReCoreUI Build
         env:
-          DEVICE: ${{ inputs.device }}
+          DEVICE: ${{ matrix.device }}
           TEST_BUILD: ${{ inputs.test_build }}
           TEST_VARIANT: ${{ inputs.test_variant }}
         run: |
@@ -91,7 +127,7 @@ jobs:
             case "$TEST_VARIANT" in
               none)
                 ;;
-              hfp_sw|sco_noenh|bt_diag)
+              bt_diag)
                 SRC="objectives/$DEVICE/tests/$TEST_VARIANT"
                 [[ -d "$SRC" ]] || { echo "Missing test folder: $SRC"; exit 1; }
                 mv "$SRC" "objectives/$DEVICE/_active_test"
@@ -119,7 +155,7 @@ jobs:
         if: always() && inputs.test_build && inputs.test_variant == 'bt_diag'
         uses: actions/upload-artifact@v4
         with:
-          name: bt-diag-${{ github.run_number }}
+          name: bt-diag-${{ matrix.device }}-${{ github.run_number }}
           path: /tmp/bt_diag
           if-no-files-found: warn
 
