@@ -1,5 +1,5 @@
 name: Build ReCoreUI
-run-name: Building ROM > ${{ inputs.device }}
+run-name: Building ROM > ${{ inputs.device }}${{ inputs.test_build && format(' [TEST {0}]', inputs.test_variant) || '' }}
 
 on:
   workflow_dispatch:
@@ -13,6 +13,22 @@ on:
         required: false
         default: false
         type: boolean
+      test_build:
+        description: 'TEST build (uploads to the test Gofile folder, zip name gets a _TEST suffix)'
+        required: false
+        default: false
+        type: boolean
+      test_variant:
+        description: 'Test variant (only used when test_build is on)'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - hfp_sw
+          - sco_noenh
+          - no_bt_patch
+          - no_spoof
 
 permissions:
   contents: read
@@ -60,12 +76,42 @@ jobs:
       - name: Run ReCoreUI Build
         env:
           DEVICE: ${{ inputs.device }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
         run: |
           set -euo pipefail
           if [[ ! "$DEVICE" =~ ^[A-Za-z0-9_-]+$ ]]; then
             echo "Invalid device name: $DEVICE"
             exit 1
           fi
+
+          if [[ "$TEST_BUILD" == "true" ]]; then
+            echo "TEST BUILD - variant: $TEST_VARIANT"
+            case "$TEST_VARIANT" in
+              none)
+                ;;
+              hfp_sw|sco_noenh)
+                SRC="objectives/$DEVICE/tests/$TEST_VARIANT"
+                [[ -d "$SRC" ]] || { echo "Missing test folder: $SRC"; exit 1; }
+                mv "$SRC" "objectives/$DEVICE/_active_test"
+                ;;
+              no_bt_patch)
+                F="recore/bt-lib/Patch-Bluetooth-library.sh"
+                [[ -f "$F" ]] || { echo "Missing $F"; exit 1; }
+                rm -f "$F"
+                ;;
+              no_spoof)
+                F="recore/mods/spoofing/spoof.sh"
+                [[ -f "$F" ]] || { echo "Missing $F"; exit 1; }
+                rm -f "$F"
+                ;;
+              *)
+                echo "Unknown test variant: $TEST_VARIANT"
+                exit 1
+                ;;
+            esac
+          fi
+
           sudo bash build.sh --build "$DEVICE"
 
       - name: Upload ROM to Gofile
@@ -73,6 +119,10 @@ jobs:
         env:
           GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
           GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
+          GOFILE_TEST_FOLDER_ID: ${{ secrets.GOFILE_TEST_FOLDER_ID }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
@@ -84,6 +134,20 @@ jobs:
           if [ -z "$ROM_FILE" ]; then
             echo "No ROM zip found!"
             exit 1
+          fi
+
+          # Test builds go to a separate Gofile folder and never touch the release folder.
+          if [[ "$TEST_BUILD" == "true" ]]; then
+            if [ -z "${GOFILE_TEST_FOLDER_ID:-}" ]; then
+              echo "GOFILE_TEST_FOLDER_ID secret is not set - refusing to upload a test build to the release folder"
+              exit 1
+            fi
+            UPLOAD_FOLDER_ID="$GOFILE_TEST_FOLDER_ID"
+            TEST_ROM_FILE="${ROM_FILE%.zip}_TEST-${TEST_VARIANT}-${RUN_NUMBER}.zip"
+            mv "$ROM_FILE" "$TEST_ROM_FILE"
+            ROM_FILE="$TEST_ROM_FILE"
+          else
+            UPLOAD_FOLDER_ID="$GOFILE_FOLDER_ID"
           fi
 
           echo "Found ROM: $ROM_FILE"
@@ -99,7 +163,7 @@ jobs:
           RESPONSE=$(curl -sS --fail-with-body --retry 3 \
             -H "Authorization: Bearer $GOFILE_TOKEN" \
             -F "file=@$ROM_FILE" \
-            -F "folderId=$GOFILE_FOLDER_ID" \
+            -F "folderId=$UPLOAD_FOLDER_ID" \
             "https://$SERVER.gofile.io/uploadFile")
 
           STATUS=$(echo "$RESPONSE" | jq -r '.status')
