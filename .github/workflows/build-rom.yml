@@ -29,6 +29,7 @@ on:
           - sco_noenh
           - no_bt_patch
           - no_spoof
+          - bt_diag
 
 permissions:
   contents: read
@@ -90,7 +91,7 @@ jobs:
             case "$TEST_VARIANT" in
               none)
                 ;;
-              hfp_sw|sco_noenh)
+              hfp_sw|sco_noenh|bt_diag)
                 SRC="objectives/$DEVICE/tests/$TEST_VARIANT"
                 [[ -d "$SRC" ]] || { echo "Missing test folder: $SRC"; exit 1; }
                 mv "$SRC" "objectives/$DEVICE/_active_test"
@@ -113,6 +114,14 @@ jobs:
           fi
 
           sudo bash build.sh --build "$DEVICE"
+
+      - name: Upload Bluetooth diagnostics
+        if: always() && inputs.test_build && inputs.test_variant == 'bt_diag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bt-diag-${{ github.run_number }}
+          path: /tmp/bt_diag
+          if-no-files-found: warn
 
       - name: Upload ROM to Gofile
         if: inputs.upload_cloud == true
