@@ -19,15 +19,10 @@ on:
         default: false
         type: boolean
       test_variant:
-        description: 'Test variant (only used when test_build is on)'
+        description: 'Test name = a folder in objectives/<device>/tests/. "none" = plain test build, "list" = only show the available tests in the run summary.'
         required: false
         default: 'none'
-        type: choice
-        options:
-          - none
-          - no_bt_patch
-          - no_spoof
-          - bt_diag
+        type: string
 
 permissions:
   contents: read
@@ -41,16 +36,30 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       devices: ${{ steps.list.outputs.devices }}
+      list_only: ${{ steps.list.outputs.list_only }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Build device list
+      - name: Build device list and check the test name
         id: list
         env:
           DEVICES: ${{ inputs.device }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
         run: |
           set -euo pipefail
+
+          avail() {
+            local dir="objectives/$1/tests" out="" t
+            if [[ -d "$dir" ]]; then
+              for t in "$dir"/*/; do
+                [[ -d "$t" ]] && out+="$(basename "$t") "
+              done
+            fi
+            echo "${out:-<none>}"
+          }
+
           LIST=()
           IFS=',' read -ra RAW <<< "$DEVICES"
           for D in "${RAW[@]}"; do
@@ -65,12 +74,41 @@ jobs:
             LIST+=("$D")
           done
           [[ ${#LIST[@]} -gt 0 ]] || { echo "No device given"; exit 1; }
+
+          {
+            echo "### Available tests (objectives/<device>/tests/)"
+            for D in "${LIST[@]}"; do
+              echo "- **$D**: $(avail "$D")"
+            done
+            echo ""
+            echo "Use test_build = on and put one of these names in test_variant."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          LIST_ONLY=false
+          if [[ "$TEST_BUILD" == "true" ]]; then
+            if [[ ! "$TEST_VARIANT" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              echo "Invalid test name: $TEST_VARIANT (letters, digits, - and _ only)"; exit 1
+            fi
+            if [[ "$TEST_VARIANT" == "list" ]]; then
+              LIST_ONLY=true
+            elif [[ "$TEST_VARIANT" != "none" ]]; then
+              for D in "${LIST[@]}"; do
+                if [[ ! -d "objectives/$D/tests/$TEST_VARIANT" ]]; then
+                  echo "No test '$TEST_VARIANT' for $D. Available for $D: $(avail "$D")"
+                  exit 1
+                fi
+              done
+            fi
+          fi
+
           JSON=$(printf '%s\n' "${LIST[@]}" | jq -R . | jq -sc .)
-          echo "Devices: $JSON"
+          echo "Devices: $JSON  list_only=$LIST_ONLY"
           echo "devices=$JSON" >> "$GITHUB_OUTPUT"
+          echo "list_only=$LIST_ONLY" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
+    if: needs.prepare.outputs.list_only != 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -122,42 +160,48 @@ jobs:
             exit 1
           fi
 
-          if [[ "$TEST_BUILD" == "true" ]]; then
-            echo "TEST BUILD - variant: $TEST_VARIANT"
-            case "$TEST_VARIANT" in
-              none)
-                ;;
-              bt_diag)
-                SRC="objectives/$DEVICE/tests/$TEST_VARIANT"
-                [[ -d "$SRC" ]] || { echo "Missing test folder: $SRC"; exit 1; }
-                mv "$SRC" "objectives/$DEVICE/_active_test"
-                ;;
-              no_bt_patch)
-                F="recore/bt-lib/Patch-Bluetooth-library.sh"
-                [[ -f "$F" ]] || { echo "Missing $F"; exit 1; }
-                rm -f "$F"
-                ;;
-              no_spoof)
-                F="recore/mods/spoofing/spoof.sh"
-                [[ -f "$F" ]] || { echo "Missing $F"; exit 1; }
-                rm -f "$F"
-                ;;
-              *)
-                echo "Unknown test variant: $TEST_VARIANT"
-                exit 1
-                ;;
-            esac
+          if [[ "$TEST_BUILD" == "true" && "$TEST_VARIANT" != "none" ]]; then
+            echo "TEST BUILD - test: $TEST_VARIANT"
+            SRC="objectives/$DEVICE/tests/$TEST_VARIANT"
+            [[ -d "$SRC" ]] || { echo "Missing test folder: $SRC"; exit 1; }
+
+            # Optional remove.txt inside the test folder: one repo path per line,
+            # deleted before the build (for "build without X" tests). '#' = comment.
+            REMOVE_LIST="$SRC/remove.txt"
+            if [[ -f "$REMOVE_LIST" ]]; then
+              while IFS= read -r P || [[ -n "$P" ]]; do
+                P="${P%$'\r'}"
+                [[ -z "$P" || "$P" == \#* ]] && continue
+                case "$P" in
+                  recore/*|platform/*|objectives/*) ;;
+                  *) echo "remove.txt: path not allowed: $P"; exit 1 ;;
+                esac
+                [[ "$P" == *..* ]] && { echo "remove.txt: '..' not allowed: $P"; exit 1; }
+                [[ -f "$P" ]] || { echo "remove.txt: not a file: $P"; exit 1; }
+                echo "Removing $P"
+                rm -f "$P"
+              done < "$REMOVE_LIST"
+              rm -f "$REMOVE_LIST"
+            fi
+
+            # The rest of the folder (its .sh scripts) becomes active for this build only.
+            mv "$SRC" "objectives/$DEVICE/_active_test"
           fi
 
           sudo bash build.sh --build "$DEVICE"
 
-      - name: Upload Bluetooth diagnostics
-        if: always() && inputs.test_build && inputs.test_variant == 'bt_diag'
+      # Test scripts may write files to /tmp/test_artifacts (older ones used /tmp/bt_diag
+      # or /tmp/lockstar_diag). Everything found there is attached to the run.
+      - name: Upload test artifacts
+        if: always() && inputs.test_build && inputs.test_variant != 'none' && inputs.test_variant != 'list'
         uses: actions/upload-artifact@v4
         with:
-          name: bt-diag-${{ matrix.device }}-${{ github.run_number }}
-          path: /tmp/bt_diag
-          if-no-files-found: warn
+          name: test-${{ inputs.test_variant }}-${{ matrix.device }}-${{ github.run_number }}
+          path: |
+            /tmp/test_artifacts
+            /tmp/bt_diag
+            /tmp/lockstar_diag
+          if-no-files-found: ignore
 
       - name: Upload ROM to Gofile
         if: inputs.upload_cloud == true
