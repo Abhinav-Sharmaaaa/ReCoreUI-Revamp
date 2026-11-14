@@ -207,3 +207,12 @@ if [ -f "$OBJECTIVE/ff.sh" ]; then
     . "$OBJECTIVE/ff.sh"
     LOG_END
 fi
+
+# LockStar: drop the aodversion token so LockStar checks clockpack (aodservice is not installed)
+_FF="$WORKSPACE/system/system/etc/floating_feature.xml"
+_AOD="$(xmlstarlet sel -t -v "//SEC_FLOATING_FEATURE_FRAMEWORK_CONFIG_AOD_ITEM" "$_FF" 2>/dev/null || true)"
+if [[ -n "$_AOD" ]]; then
+    _NEW="$(echo "$_AOD" | sed -E 's/(^|,)aodversion=[^,]*//; s/^,//')"
+    xmlstarlet ed -L -u "//SEC_FLOATING_FEATURE_FRAMEWORK_CONFIG_AOD_ITEM" -v "$_NEW" "$_FF"
+    LOG_INFO "AOD_ITEM: '$_AOD' -> '$_NEW'"
+fi
