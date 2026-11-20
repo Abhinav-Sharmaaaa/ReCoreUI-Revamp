@@ -1,0 +1,226 @@
+name: Build ReCoreUI
+run-name: Building ROM > ${{ inputs.device }}${{ inputs.test_build && format(' [TEST {0}]', inputs.test_variant) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Objective, or several separated by commas (e.g. a14x,a146m,m14x,f14x). Built one after another.'
+        required: true
+        default: 'a14x'
+      upload_cloud:
+        description: 'Upload ROM to cloud (GoFile)'
+        required: false
+        default: false
+        type: boolean
+      test_build:
+        description: 'TEST build (uploads to the test Gofile folder, zip name gets a _TEST suffix)'
+        required: false
+        default: false
+        type: boolean
+      test_variant:
+        description: 'Test variant (only used when test_build is on)'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - no_bt_patch
+          - no_spoof
+          - bt_diag
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-rom
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      devices: ${{ steps.list.outputs.devices }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build device list
+        id: list
+        env:
+          DEVICES: ${{ inputs.device }}
+        run: |
+          set -euo pipefail
+          LIST=()
+          IFS=',' read -ra RAW <<< "$DEVICES"
+          for D in "${RAW[@]}"; do
+            D="$(echo "$D" | tr -d '[:space:]')"
+            [[ -z "$D" ]] && continue
+            if [[ ! "$D" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              echo "Invalid device name: $D"; exit 1
+            fi
+            if [[ ! -d "objectives/$D" ]]; then
+              echo "No objectives/$D folder in this repo"; exit 1
+            fi
+            LIST+=("$D")
+          done
+          [[ ${#LIST[@]} -gt 0 ]] || { echo "No device given"; exit 1; }
+          JSON=$(printf '%s\n' "${LIST[@]}" | jq -R . | jq -sc .)
+          echo "Devices: $JSON"
+          echo "devices=$JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        device: ${{ fromJSON(needs.prepare.outputs.devices) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space (1/3) - System Junk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost /usr/share/swift /usr/local/lib/node_modules
+          sudo rm -rf /usr/local/share/chromium /usr/share/sbt
+          sudo docker image prune --all --force
+          sudo docker builder prune --all --force
+          sudo apt-get clean
+
+      # Pinned to the commit that "main" pointed to when this file was written
+      - name: Free disk space (2/3) - Tool Cache
+        uses: jlumbroso/free-disk-space@cf1e78c50ca91e757bab3edc229027eebfc07871
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Free disk space (3/3)
+        uses: rokibhasansagar/slimhub_actions@c2a6e4317d3de2b623ac7395b05e9d2149e8289b
+        with:
+          retain: 'compiler_cmake'
+
+      - name: Disk Space Check
+        run: df -h /
+
+      - name: Run ReCoreUI Build
+        env:
+          DEVICE: ${{ matrix.device }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEVICE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "Invalid device name: $DEVICE"
+            exit 1
+          fi
+
+          if [[ "$TEST_BUILD" == "true" ]]; then
+            echo "TEST BUILD - variant: $TEST_VARIANT"
+            case "$TEST_VARIANT" in
+              none)
+                ;;
+              bt_diag)
+                SRC="objectives/$DEVICE/tests/$TEST_VARIANT"
+                [[ -d "$SRC" ]] || { echo "Missing test folder: $SRC"; exit 1; }
+                mv "$SRC" "objectives/$DEVICE/_active_test"
+                ;;
+              no_bt_patch)
+                F="recore/bt-lib/Patch-Bluetooth-library.sh"
+                [[ -f "$F" ]] || { echo "Missing $F"; exit 1; }
+                rm -f "$F"
+                ;;
+              no_spoof)
+                F="recore/mods/spoofing/spoof.sh"
+                [[ -f "$F" ]] || { echo "Missing $F"; exit 1; }
+                rm -f "$F"
+                ;;
+              *)
+                echo "Unknown test variant: $TEST_VARIANT"
+                exit 1
+                ;;
+            esac
+          fi
+
+          sudo bash build.sh --build "$DEVICE"
+
+      - name: Upload Bluetooth diagnostics
+        if: always() && inputs.test_build && inputs.test_variant == 'bt_diag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bt-diag-${{ matrix.device }}-${{ github.run_number }}
+          path: /tmp/bt_diag
+          if-no-files-found: warn
+
+      - name: Upload ROM to Gofile
+        if: inputs.upload_cloud == true
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
+          GOFILE_TEST_FOLDER_ID: ${{ secrets.GOFILE_TEST_FOLDER_ID }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          echo "Searching for ROM zip..."
+          ROM_FILE=$(find out -type f -name "*_signed.zip" | head -n 1)
+          if [ -z "$ROM_FILE" ]; then
+            ROM_FILE=$(find out -type f -name "*.zip" | head -n 1)
+          fi
+          if [ -z "$ROM_FILE" ]; then
+            echo "No ROM zip found!"
+            exit 1
+          fi
+
+          # Test builds go to a separate Gofile folder and never touch the release folder.
+          if [[ "$TEST_BUILD" == "true" ]]; then
+            if [ -z "${GOFILE_TEST_FOLDER_ID:-}" ]; then
+              echo "GOFILE_TEST_FOLDER_ID secret is not set - refusing to upload a test build to the release folder"
+              exit 1
+            fi
+            UPLOAD_FOLDER_ID="$GOFILE_TEST_FOLDER_ID"
+            TEST_ROM_FILE="${ROM_FILE%.zip}_TEST-${TEST_VARIANT}-${RUN_NUMBER}.zip"
+            mv "$ROM_FILE" "$TEST_ROM_FILE"
+            ROM_FILE="$TEST_ROM_FILE"
+          else
+            UPLOAD_FOLDER_ID="$GOFILE_FOLDER_ID"
+          fi
+
+          echo "Found ROM: $ROM_FILE"
+          ls -lh "$ROM_FILE"
+          sha256sum "$ROM_FILE"
+
+          SERVER=$(curl -sS --fail-with-body --retry 3 https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+          if [ -z "$SERVER" ] || [ "$SERVER" = "null" ]; then
+            echo "Could not get a Gofile server"
+            exit 1
+          fi
+
+          RESPONSE=$(curl -sS --fail-with-body --retry 3 \
+            -H "Authorization: Bearer $GOFILE_TOKEN" \
+            -F "file=@$ROM_FILE" \
+            -F "folderId=$UPLOAD_FOLDER_ID" \
+            "https://$SERVER.gofile.io/uploadFile")
+
+          STATUS=$(echo "$RESPONSE" | jq -r '.status')
+          if [ "$STATUS" != "ok" ]; then
+            echo "Upload failed:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          DOWNLOAD_LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage')
+
+          echo "=============================="
+          echo "Upload Successful!"
+          echo "Download Link: $DOWNLOAD_LINK"
+          echo "=============================="
