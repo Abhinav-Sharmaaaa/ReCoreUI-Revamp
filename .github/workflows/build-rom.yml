@@ -13,6 +13,11 @@ on:
         required: false
         default: false
         type: boolean
+      max_compress:
+        description: 'Recompress the ROM zip with maximum Deflate before uploading (smaller download, slower build; skipped for whole-file-signed zips, never makes the zip bigger)'
+        required: false
+        default: true
+        type: boolean
       test_build:
         description: 'TEST build (uploads to the test Gofile folder, zip name gets a _TEST suffix)'
         required: false
@@ -202,6 +207,78 @@ jobs:
             /tmp/bt_diag
             /tmp/lockstar_diag
           if-no-files-found: ignore
+
+      # Recompress the finished ROM zip with the strongest Deflate (recovery unzip only reads STORED and
+      # DEFLATE, so LZMA/zstd are not an option). The original is kept unless the new zip is intact, has the
+      # same entries in the same order, and is smaller. Any failure here just keeps the original zip.
+      - name: Recompress ROM zip (maximum Deflate)
+        if: inputs.upload_cloud == true && inputs.max_compress == true
+        run: |
+          sudo apt-get install -y -qq p7zip-full > /dev/null
+          set -uo pipefail
+
+          ROM_FILE=$(find out -type f -name "*_signed.zip" | head -n 1)
+          if [ -z "$ROM_FILE" ]; then
+            ROM_FILE=$(find out -type f -name "*.zip" | head -n 1)
+          fi
+          if [ -z "$ROM_FILE" ]; then
+            echo "No ROM zip found - skipping recompression"
+            exit 0
+          fi
+
+          # A whole-file signature (signapk -w, used for OTA zips) covers the exact bytes of the zip, so recompressing would break it.
+          if unzip -z "$ROM_FILE" 2>/dev/null | grep -qi 'signed by SignApk'; then
+            echo "::warning::$ROM_FILE has a whole-file signature - recompressing would invalidate it, skipping"
+            exit 0
+          fi
+
+          ORIG_SIZE=$(stat -c %s "$ROM_FILE")
+          echo "Original: $ROM_FILE ($ORIG_SIZE bytes)"
+          unzip -v "$ROM_FILE" | tail -n 1
+
+          WORK=$(mktemp -d)
+          cleanup() { rm -rf "$WORK"; }
+          trap cleanup EXIT
+
+          # Keep the entry order of the original zip (installers expect META-INF first).
+          unzip -Z1 "$ROM_FILE" | grep -v '/$' > "$WORK/order.txt" || true
+          if [ ! -s "$WORK/order.txt" ]; then
+            echo "::warning::could not read the zip entries - keeping the original"
+            exit 0
+          fi
+
+          mkdir "$WORK/x"
+          if ! unzip -q "$ROM_FILE" -d "$WORK/x"; then
+            echo "::warning::extract failed - keeping the original"
+            exit 0
+          fi
+
+          # Recovery unzip only understands STORED and DEFLATE, so use the strongest Deflate 7-Zip has.
+          if ! (cd "$WORK/x" && 7z a -tzip -mm=Deflate -mx=9 -mfb=258 -mpass=15 -mmt=on -bd -bso0 -y "$WORK/new.zip" "@$WORK/order.txt"); then
+            echo "::warning::7z failed - keeping the original"
+            exit 0
+          fi
+
+          # Never replace the ROM unless the new zip is intact, has the same files in the same order, and is smaller.
+          if ! unzip -tq "$WORK/new.zip" > /dev/null; then
+            echo "::warning::new zip failed the integrity test - keeping the original"
+            exit 0
+          fi
+          unzip -Z1 "$WORK/new.zip" > "$WORK/new_order.txt"
+          if ! cmp -s "$WORK/order.txt" "$WORK/new_order.txt"; then
+            echo "::warning::entry list or order differs - keeping the original"
+            exit 0
+          fi
+          NEW_SIZE=$(stat -c %s "$WORK/new.zip")
+          if [ "$NEW_SIZE" -ge "$ORIG_SIZE" ]; then
+            echo "No gain ($NEW_SIZE >= $ORIG_SIZE bytes) - keeping the original"
+            exit 0
+          fi
+
+          mv -f "$WORK/new.zip" "$ROM_FILE"
+          echo "Recompressed: $ORIG_SIZE -> $NEW_SIZE bytes (saved $(( (ORIG_SIZE - NEW_SIZE) * 100 / ORIG_SIZE ))%)"
+          unzip -v "$ROM_FILE" | tail -n 1
+          sha256sum "$ROM_FILE"
 
       - name: Upload ROM to Gofile
         if: inputs.upload_cloud == true
