@@ -569,7 +569,7 @@ cat > "$_GD/SemFpGestureManager.smali" <<'EOF_GESTURE_SMALI'
 
     iget-object v6, p0, Lcom/android/server/biometrics/sensors/fingerprint/SemFpGestureManager;->mH:Landroid/os/Handler;
 
-    invoke-static/range {v1 .. v6}, Lcom/android/server/biometrics/sensors/fingerprint/SemFpGestureManager->regAsUser(Landroid/content/Context;Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;Landroid/os/UserHandle;Ljava/lang/String;Landroid/os/Handler;)V
+    invoke-static/range {v1 .. v6}, Lcom/android/server/biometrics/sensors/fingerprint/SemFpGestureManager;->regAsUser(Landroid/content/Context;Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;Landroid/os/UserHandle;Ljava/lang/String;Landroid/os/Handler;)V
 
     :goto_53
     return-void
