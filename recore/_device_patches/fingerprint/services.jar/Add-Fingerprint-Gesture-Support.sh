@@ -6,6 +6,7 @@
 #   2. adds SemBiometricFeature.FP_FEATURE_GESTURE_MODE and makes FingerprintService.semHasFeature(1) return it
 #      (this is what makes Settings > Advanced features > Motions and gestures > Finger sensor gestures appear)
 #   3. hooks the manager into FingerprintService startup (boot phase 0x258)
+#   4. restores the stripped onGestureEvent call in the HAL event dispatcher (SemFpAidlResponseHandler$$ExternalSyntheticLambda8)
 # DEBUG BUILD: stock debug logging is on (Utils.DEBUG -> true), every gesture event and the HAL gesture-mode
 # request result are logged under the tag FingerprintService.Gesture.
 # Every entry point is wrapped in try/catch(Throwable), so a runtime failure logs a warning under the tag
@@ -1476,5 +1477,24 @@ if 'SemFpGestureManager;->install' not in t:
             '    :gest_done\n') % (ext, prov, FP, FP, FP, prov)
     t = t[:m.end()] + hook + t[m.end():]
     open(p, 'w').write(t)
+# 4) the base's HAL event dispatcher loops over the listeners for vendor codes 20001/20002 but no longer calls them
+#    (only a getClass() null-check is left); put the onGestureEvent call back
+p = find('SemFpAidlResponseHandler$$ExternalSyntheticLambda8.smali'); t = open(p).read()
+if 'SemFpEventListener;->onGestureEvent' not in t:
+    m = re.search(r'const/16 (v\d+), 0x4e21\s+if-eq (p\d), \1, :(\w+)', t)
+    if not m: sys.exit('gesture: 0x4e21 branch not found in the HAL event dispatcher')
+    code, lab = m.group(2), m.group(3)
+    i = t.find('\n    :%s\n' % lab)
+    if i < 0: sys.exit('gesture: dispatch label not found')
+    j = i + 1 + len('    :%s\n' % lab)
+    tail = t[j:j + 1500]
+    pat = re.compile(r'(check-cast (v\d+), ' + re.escape(FP) + r'SemFpEventListener;\s+)invoke-virtual \{\2\}, Ljava/lang/Object;->getClass\(\)Ljava/lang/Class;')
+    mm = pat.search(tail)
+    if not mm: sys.exit('gesture: listener loop not found in the HAL event dispatcher')
+    mm_new = mm.group(1) + 'invoke-interface {%s, v4}, %sSemFpEventListener;->onGestureEvent(I)V' % (mm.group(2), FP)
+    tail = tail[:mm.start()] + mm_new + tail[mm.end():]
+    t = t[:j] + '\n    move v4, %s\n' % code + tail + t[j + 1500:]
+    open(p, 'w').write(t)
+
 print('gesture: services.jar patched')
 EOF_GESTURE_PY
