@@ -6,6 +6,8 @@
 #   2. adds SemBiometricFeature.FP_FEATURE_GESTURE_MODE and makes FingerprintService.semHasFeature(1) return it
 #      (this is what makes Settings > Advanced features > Motions and gestures > Finger sensor gestures appear)
 #   3. hooks the manager into FingerprintService startup (boot phase 0x258)
+# DEBUG BUILD: stock debug logging is on (Utils.DEBUG -> true), every gesture event and the HAL gesture-mode
+# request result are logged under the tag FingerprintService.Gesture.
 # Every entry point is wrapped in try/catch(Throwable), so a runtime failure logs a warning under the tag
 # FingerprintService.Gesture instead of crashing system_server.
 
@@ -178,7 +180,7 @@ cat > "$_GD/SemFpGestureManager.smali" <<'EOF_GESTURE_SMALI'
 
     if-eqz v1, :cond_35
 
-    const/16 p0, 0x0
+    const/16 p0, 0x1
 
     if-eqz p0, :cond_28
 
@@ -280,7 +282,7 @@ cat > "$_GD/SemFpGestureManager.smali" <<'EOF_GESTURE_SMALI'
     :cond_23
     iget-object v0, p0, Lcom/android/server/biometrics/sensors/fingerprint/SemFpGestureManager;->mContext:Landroid/content/Context;
 
-    const/16 v2, 0x0
+    const/16 v2, 0x1
 
     const/16 v2, 0x0
 
@@ -524,6 +526,20 @@ cat > "$_GD/SemFpGestureManager.smali" <<'EOF_GESTURE_SMALI'
 
     invoke-virtual/range {v1 .. v6}, Lcom/android/server/biometrics/sensors/fingerprint/aidl/FingerprintProvider;->semRequest(III[B[B)I
 
+    move-result v0
+
+    const-string v2, "FingerprintService.Gesture"
+
+    const-string v3, "turnOnGestureMode: semRequest(15) result:"
+
+    invoke-static {v2, v3}, Landroid/util/Slog;->d(Ljava/lang/String;Ljava/lang/String;)I
+
+    invoke-static {v0}, Ljava/lang/Integer;->toString(I)Ljava/lang/String;
+
+    move-result-object v0
+
+    invoke-static {v2, v0}, Landroid/util/Slog;->d(Ljava/lang/String;Ljava/lang/String;)I
+
     iget-object v0, p0, Lcom/android/server/biometrics/sensors/fingerprint/SemFpGestureManager;->mBroadCastReceiver:Landroid/content/BroadcastReceiver;
 
     if-eqz v0, :cond_26
@@ -712,6 +728,14 @@ cat > "$_GD/SemFpGestureManager.smali" <<'EOF_GESTURE_SMALI'
     .locals 2
 
     :try_start_0
+    invoke-static {p1}, Ljava/lang/Integer;->toString(I)Ljava/lang/String;
+
+    move-result-object v0
+
+    const-string v1, "FingerprintService.Gesture"
+
+    invoke-static {v1, v0}, Landroid/util/Slog;->d(Ljava/lang/String;Ljava/lang/String;)I
+
     invoke-virtual {p0, p1}, Lcom/android/server/biometrics/sensors/fingerprint/SemFpGestureManager;->onGestureEventInner(I)V
     :try_end_0
     .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0
