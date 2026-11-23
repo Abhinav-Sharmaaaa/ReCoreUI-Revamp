@@ -13,11 +13,25 @@ on:
         required: false
         default: false
         type: boolean
-      max_compress:
-        description: 'Recompress the ROM zip with maximum Deflate before uploading (smaller download, slower build; skipped for whole-file-signed zips, never makes the zip bigger)'
+      channel:
+        description: 'OTA channel of this build. It is written into the ROM (ro.recore.ota.channel) and used by publish_ota.'
+        required: true
+        default: 'test'
+        type: choice
+        options:
+          - test
+          - beta
+          - release
+      publish_ota:
+        description: 'Publish the zip to the public OTA repo (GitHub release) and update the feed of this channel'
         required: false
-        default: true
+        default: false
         type: boolean
+      changelog:
+        description: 'Changelog shown by the updater (empty = a default line)'
+        required: false
+        default: ''
+        type: string
       test_build:
         description: 'TEST build (uploads to the test Gofile folder, zip name gets a _TEST suffix)'
         required: false
@@ -158,6 +172,8 @@ jobs:
           DEVICE: ${{ matrix.device }}
           TEST_BUILD: ${{ inputs.test_build }}
           TEST_VARIANT: ${{ inputs.test_variant }}
+          RECORE_CHANNEL: ${{ inputs.channel }}
+          RECORE_BUILD_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
           if [[ ! "$DEVICE" =~ ^[A-Za-z0-9_-]+$ ]]; then
@@ -193,7 +209,7 @@ jobs:
             mv "$SRC" "objectives/$DEVICE/_active_test"
           fi
 
-          sudo bash build.sh --build "$DEVICE"
+          sudo --preserve-env=RECORE_CHANNEL,RECORE_BUILD_NUMBER bash build.sh --build "$DEVICE"
 
       # Test scripts may write files to /tmp/test_artifacts (older ones used /tmp/bt_diag
       # or /tmp/lockstar_diag). Everything found there is attached to the run.
@@ -208,77 +224,72 @@ jobs:
             /tmp/lockstar_diag
           if-no-files-found: ignore
 
-      # Recompress the finished ROM zip with the strongest Deflate (recovery unzip only reads STORED and
-      # DEFLATE, so LZMA/zstd are not an option). The original is kept unless the new zip is intact, has the
-      # same entries in the same order, and is smaller. Any failure here just keeps the original zip.
-      - name: Recompress ROM zip (maximum Deflate)
-        if: inputs.upload_cloud == true && inputs.max_compress == true
+      # Publishes the finished zip to a PUBLIC repo (the updater app needs plain download links) and updates
+      # the feed file of this device and channel. Needs the repository variable OTA_REPO (owner/name) and the
+      # secret OTA_REPO_TOKEN. Diagnostic test builds are never published.
+      - name: Publish OTA (GitHub release and feed)
+        if: inputs.publish_ota == true && (inputs.test_build != true || inputs.test_variant == 'none')
+        env:
+          OTA_REPO: ${{ vars.OTA_REPO }}
+          GH_TOKEN: ${{ secrets.OTA_REPO_TOKEN }}
+          DEVICE: ${{ matrix.device }}
+          CHANNEL: ${{ inputs.channel }}
+          BUILD: ${{ github.run_number }}
+          CHANGELOG: ${{ inputs.changelog }}
         run: |
-          sudo apt-get install -y -qq p7zip-full > /dev/null
-          set -uo pipefail
+          set -euo pipefail
+
+          : "${OTA_REPO:?Set the repository variable OTA_REPO to the public OTA repo, for example yourname/ReCoreUI-OTA}"
+          : "${GH_TOKEN:?Add the secret OTA_REPO_TOKEN (fine-grained token with Contents: read and write on the OTA repo)}"
 
           ROM_FILE=$(find out -type f -name "*_signed.zip" | head -n 1)
           if [ -z "$ROM_FILE" ]; then
             ROM_FILE=$(find out -type f -name "*.zip" | head -n 1)
           fi
-          if [ -z "$ROM_FILE" ]; then
-            echo "No ROM zip found - skipping recompression"
-            exit 0
+          [ -n "$ROM_FILE" ] || { echo "No ROM zip found"; exit 1; }
+
+          NAME=$(basename "$ROM_FILE")
+          SIZE=$(stat -c %s "$ROM_FILE")
+          SHA=$(sha256sum "$ROM_FILE" | cut -d' ' -f1)
+
+          # GitHub release assets are limited to 2 GiB each.
+          if [ "$SIZE" -ge 2147483648 ]; then
+            echo "::error::$NAME is $SIZE bytes; GitHub release assets are limited to 2 GiB. Host the zip elsewhere (SourceForge, R2) or shrink it."
+            exit 1
           fi
 
-          # A whole-file signature (signapk -w, used for OTA zips) covers the exact bytes of the zip, so recompressing would break it.
-          if unzip -z "$ROM_FILE" 2>/dev/null | grep -qi 'signed by SignApk'; then
-            echo "::warning::$ROM_FILE has a whole-file signature - recompressing would invalidate it, skipping"
-            exit 0
-          fi
+          TAG="${DEVICE}-${CHANNEL}-${BUILD}"
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          URL="https://github.com/${OTA_REPO}/releases/download/${TAG}/${NAME}"
+          LOG_TEXT="${CHANGELOG:-}"
+          [ -n "$LOG_TEXT" ] || LOG_TEXT="Build ${BUILD} (${CHANNEL})"
 
-          ORIG_SIZE=$(stat -c %s "$ROM_FILE")
-          echo "Original: $ROM_FILE ($ORIG_SIZE bytes)"
-          unzip -v "$ROM_FILE" | tail -n 1
+          {
+            echo "$LOG_TEXT"
+            echo
+            echo "sha256: $SHA"
+          } > notes.md
 
-          WORK=$(mktemp -d)
-          cleanup() { rm -rf "$WORK"; }
-          trap cleanup EXIT
+          PRE=()
+          if [ "$CHANNEL" != "release" ]; then PRE=(--prerelease); fi
+          gh release create "$TAG" "$ROM_FILE" --repo "$OTA_REPO" --title "${DEVICE} ${CHANNEL} ${BUILD}" --notes-file notes.md "${PRE[@]}"
 
-          # Keep the entry order of the original zip (installers expect META-INF first).
-          unzip -Z1 "$ROM_FILE" | grep -v '/$' > "$WORK/order.txt" || true
-          if [ ! -s "$WORK/order.txt" ]; then
-            echo "::warning::could not read the zip entries - keeping the original"
-            exit 0
-          fi
+          FEED="${DEVICE}-${CHANNEL}.json"
+          jq -n \
+            --arg device "$DEVICE" --arg channel "$CHANNEL" --argjson build "$BUILD" \
+            --arg date "$DATE" --arg filename "$NAME" --arg url "$URL" \
+            --argjson size "$SIZE" --arg sha256 "$SHA" --arg changelog "$LOG_TEXT" \
+            '{device:$device, channel:$channel, build:$build, date:$date, filename:$filename, url:$url, size:$size, sha256:$sha256, changelog:$changelog}' > "$FEED"
+          cat "$FEED"
 
-          mkdir "$WORK/x"
-          if ! unzip -q "$ROM_FILE" -d "$WORK/x"; then
-            echo "::warning::extract failed - keeping the original"
-            exit 0
+          # Rolling release "feed" holds one JSON per device and channel, so the feed URL never changes.
+          if ! gh release view feed --repo "$OTA_REPO" > /dev/null 2>&1; then
+            gh release create feed --repo "$OTA_REPO" --title "OTA feed" --notes "Rolling update feed. Do not delete." --prerelease
           fi
+          gh release upload feed "$FEED" --repo "$OTA_REPO" --clobber
 
-          # Recovery unzip only understands STORED and DEFLATE, so use the strongest Deflate 7-Zip has.
-          if ! (cd "$WORK/x" && 7z a -tzip -mm=Deflate -mx=9 -mfb=258 -mpass=15 -mmt=on -bd -bso0 -y "$WORK/new.zip" "@$WORK/order.txt"); then
-            echo "::warning::7z failed - keeping the original"
-            exit 0
-          fi
-
-          # Never replace the ROM unless the new zip is intact, has the same files in the same order, and is smaller.
-          if ! unzip -tq "$WORK/new.zip" > /dev/null; then
-            echo "::warning::new zip failed the integrity test - keeping the original"
-            exit 0
-          fi
-          unzip -Z1 "$WORK/new.zip" > "$WORK/new_order.txt"
-          if ! cmp -s "$WORK/order.txt" "$WORK/new_order.txt"; then
-            echo "::warning::entry list or order differs - keeping the original"
-            exit 0
-          fi
-          NEW_SIZE=$(stat -c %s "$WORK/new.zip")
-          if [ "$NEW_SIZE" -ge "$ORIG_SIZE" ]; then
-            echo "No gain ($NEW_SIZE >= $ORIG_SIZE bytes) - keeping the original"
-            exit 0
-          fi
-
-          mv -f "$WORK/new.zip" "$ROM_FILE"
-          echo "Recompressed: $ORIG_SIZE -> $NEW_SIZE bytes (saved $(( (ORIG_SIZE - NEW_SIZE) * 100 / ORIG_SIZE ))%)"
-          unzip -v "$ROM_FILE" | tail -n 1
-          sha256sum "$ROM_FILE"
+          echo "Published $TAG"
+          echo "Feed: https://github.com/${OTA_REPO}/releases/download/feed/${FEED}"
 
       - name: Upload ROM to Gofile
         if: inputs.upload_cloud == true
