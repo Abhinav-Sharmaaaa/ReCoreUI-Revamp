@@ -225,10 +225,18 @@ jobs:
             /tmp/lockstar_diag
           if-no-files-found: ignore
 
-      # Publishes the finished zip to a PUBLIC repo (the updater app needs plain download links) and updates
-      # the feed file of this device and channel. Needs the repository variable OTA_REPO (owner/name) and the
-      # secret OTA_REPO_TOKEN. Diagnostic test builds are never published.
-      - name: Publish OTA (GitHub release and feed)
+      # Publishes the OTA to a PUBLIC repo (the updater app needs plain download links). The full ROM zip is far
+      # over GitHub's 2 GiB limit, so it is NOT published; only a small delta zip (the changes since the previous
+      # build of this device and channel) and the chunk index of this build's super.img are. The first build of a
+      # channel only publishes the index (the baseline); phones flash its full zip once. Needs the repository
+      # variable OTA_REPO (owner/name) and the secret OTA_REPO_TOKEN. Diagnostic test builds are never published.
+      - name: Set up Go (OTA delta tool)
+        if: inputs.publish_ota == true && (inputs.test_build != true || inputs.test_variant == 'none')
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Publish OTA (delta zip, index and feed)
         if: inputs.publish_ota == true && (inputs.test_build != true || inputs.test_variant == 'none')
         env:
           OTA_REPO: ${{ vars.OTA_REPO }}
@@ -239,7 +247,6 @@ jobs:
           CHANGELOG: ${{ inputs.changelog }}
         run: |
           set -euo pipefail
-
           : "${OTA_REPO:?Set the repository variable OTA_REPO to the public OTA repo, for example yourname/ReCoreUI-OTA}"
           : "${GH_TOKEN:?Add the secret OTA_REPO_TOKEN (fine-grained token with Contents: read and write on the OTA repo)}"
 
@@ -249,41 +256,30 @@ jobs:
           fi
           [ -n "$ROM_FILE" ] || { echo "No ROM zip found"; exit 1; }
 
-          NAME=$(basename "$ROM_FILE")
-          SIZE=$(stat -c %s "$ROM_FILE")
-          SHA=$(sha256sum "$ROM_FILE" | cut -d' ' -f1)
-
-          # GitHub release assets are limited to 2 GiB each.
-          if [ "$SIZE" -ge 2147483648 ]; then
-            echo "::error::$NAME is $SIZE bytes; GitHub release assets are limited to 2 GiB. Host the zip elsewhere (SourceForge, R2) or shrink it."
-            exit 1
-          fi
-
-          TAG="${DEVICE}-${CHANNEL}-${BUILD}"
-          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          URL="https://github.com/${OTA_REPO}/releases/download/${TAG}/${NAME}"
           LOG_TEXT="${CHANGELOG:-}"
           [ -n "$LOG_TEXT" ] || LOG_TEXT="Build ${BUILD} (${CHANNEL})"
+
+          bash tools/ota/make-delta.sh "$ROM_FILE" "$DEVICE" "$CHANNEL" "$BUILD" "$OTA_REPO" "$LOG_TEXT" ota_out
+
+          TAG="${DEVICE}-${CHANNEL}-${BUILD}"
+          ASSETS=(ota_out/super.idx)
+          shopt -s nullglob
+          for z in ota_out/ReCore-OTA_*.zip; do ASSETS+=("$z"); done
+          shopt -u nullglob
 
           {
             echo "$LOG_TEXT"
             echo
-            echo "sha256: $SHA"
+            echo "type: $(jq -r .type ota_out/feed.json), super sha256: $(jq -r .super_sha256 ota_out/feed.json)"
           } > notes.md
 
           PRE=()
           if [ "$CHANNEL" != "release" ]; then PRE=(--prerelease); fi
-          gh release create "$TAG" "$ROM_FILE" --repo "$OTA_REPO" --title "${DEVICE} ${CHANNEL} ${BUILD}" --notes-file notes.md "${PRE[@]}"
-
-          FEED="${DEVICE}-${CHANNEL}.json"
-          jq -n \
-            --arg device "$DEVICE" --arg channel "$CHANNEL" --argjson build "$BUILD" \
-            --arg date "$DATE" --arg filename "$NAME" --arg url "$URL" \
-            --argjson size "$SIZE" --arg sha256 "$SHA" --arg changelog "$LOG_TEXT" \
-            '{device:$device, channel:$channel, build:$build, date:$date, filename:$filename, url:$url, size:$size, sha256:$sha256, changelog:$changelog}' > "$FEED"
-          cat "$FEED"
+          gh release create "$TAG" "${ASSETS[@]}" --repo "$OTA_REPO" --title "${DEVICE} ${CHANNEL} ${BUILD}" --notes-file notes.md "${PRE[@]}"
 
           # Rolling release "feed" holds one JSON per device and channel, so the feed URL never changes.
+          FEED="${DEVICE}-${CHANNEL}.json"
+          cp ota_out/feed.json "$FEED"
           if ! gh release view feed --repo "$OTA_REPO" > /dev/null 2>&1; then
             gh release create feed --repo "$OTA_REPO" --title "OTA feed" --notes "Rolling update feed. Do not delete." --prerelease
           fi
