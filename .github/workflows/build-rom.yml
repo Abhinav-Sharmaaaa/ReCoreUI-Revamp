@@ -250,6 +250,19 @@ jobs:
           : "${OTA_REPO:?Set the repository variable OTA_REPO to the public OTA repo, for example yourname/ReCoreUI-OTA}"
           : "${GH_TOKEN:?Add the secret OTA_REPO_TOKEN (fine-grained token with Contents: read and write on the OTA repo)}"
 
+          # The disk-cleanup steps above remove the GitHub CLI, so make sure it is there.
+          if ! command -v gh > /dev/null 2>&1; then
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq gh || true
+          fi
+          if ! command -v gh > /dev/null 2>&1; then
+            URL=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | jq -r '.assets[] | select(.name | endswith("linux_amd64.tar.gz")) | .browser_download_url' | head -n 1)
+            [ -n "$URL" ] || { echo "Could not find a GitHub CLI download"; exit 1; }
+            curl -fsSL "$URL" -o /tmp/gh.tar.gz
+            sudo tar -xzf /tmp/gh.tar.gz -C /usr/local --strip-components=1
+          fi
+          gh --version
+
           ROM_FILE=$(find out -type f -name "*_signed.zip" | head -n 1)
           if [ -z "$ROM_FILE" ]; then
             ROM_FILE=$(find out -type f -name "*.zip" | head -n 1)
