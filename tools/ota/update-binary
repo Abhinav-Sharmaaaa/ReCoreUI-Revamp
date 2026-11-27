@@ -31,10 +31,8 @@ unzip -o "$ZIP" -d "$TMP" > /dev/null 2>&1 || abort "Could not unpack the update
 . "$TMP/manifest.sh"
 chmod 755 "$TMP/rcdelta"
 
-DEV=$(getprop ro.product.device)
-if [ -n "$DEV" ] && [ "$DEV" != "$DEVICE" ]; then
-    abort "This update is for $DEVICE, this device is $DEV."
-fi
+# No device-name check: the objective name is not always ro.product.device. Safety comes from rcdelta,
+# which checks every chunk of the installed system against the base build of this update before writing anything.
 ui_print "Updating build $FROM_BUILD to $TO_BUILD ($CHANNEL)"
 
 find_block() {

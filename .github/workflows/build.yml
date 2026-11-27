@@ -1,0 +1,369 @@
+name: Build ReCoreUI
+run-name: Building ROM > ${{ inputs.device }}${{ inputs.test_build && format(' [TEST {0}]', inputs.test_variant) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Objective, or several separated by commas (e.g. a14x,a146m,m14x,f14x). Built one after another.'
+        required: true
+        default: 'a14x'
+      upload_cloud:
+        description: 'Upload ROM to cloud (GoFile)'
+        required: false
+        default: false
+        type: boolean
+      channel:
+        description: 'OTA channel of this build. It is written into the ROM (ro.recore.ota.channel) and used by publish_ota.'
+        required: true
+        default: 'test'
+        type: choice
+        options:
+          - test
+          - beta
+          - release
+      publish_ota:
+        description: 'Publish the zip to the public OTA repo (GitHub release) and update the feed of this channel'
+        required: false
+        default: false
+        type: boolean
+      changelog:
+        description: 'Changelog shown by the updater (empty = a default line)'
+        required: false
+        default: ''
+        type: string
+      test_build:
+        description: 'TEST build (uploads to the test Gofile folder, zip name gets a _TEST suffix)'
+        required: false
+        default: false
+        type: boolean
+      test_variant:
+        description: 'Test name = a folder in objectives/<device>/tests/. "none" = plain test build, "list" = only show the available tests in the run summary.'
+        required: false
+        default: 'none'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-rom
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      devices: ${{ steps.list.outputs.devices }}
+      list_only: ${{ steps.list.outputs.list_only }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build device list and check the test name
+        id: list
+        env:
+          DEVICES: ${{ inputs.device }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
+        run: |
+          set -euo pipefail
+
+          avail() {
+            local dir="objectives/$1/tests" out="" t
+            if [[ -d "$dir" ]]; then
+              for t in "$dir"/*/; do
+                [[ -d "$t" ]] && out+="$(basename "$t") "
+              done
+            fi
+            echo "${out:-<none>}"
+          }
+
+          LIST=()
+          IFS=',' read -ra RAW <<< "$DEVICES"
+          for D in "${RAW[@]}"; do
+            D="$(echo "$D" | tr -d '[:space:]')"
+            [[ -z "$D" ]] && continue
+            if [[ ! "$D" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              echo "Invalid device name: $D"; exit 1
+            fi
+            if [[ ! -d "objectives/$D" ]]; then
+              echo "No objectives/$D folder in this repo"; exit 1
+            fi
+            LIST+=("$D")
+          done
+          [[ ${#LIST[@]} -gt 0 ]] || { echo "No device given"; exit 1; }
+
+          {
+            echo "### Available tests (objectives/<device>/tests/)"
+            for D in "${LIST[@]}"; do
+              echo "- **$D**: $(avail "$D")"
+            done
+            echo ""
+            echo "Use test_build = on and put one of these names in test_variant."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          LIST_ONLY=false
+          if [[ "$TEST_BUILD" == "true" ]]; then
+            if [[ ! "$TEST_VARIANT" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              echo "Invalid test name: $TEST_VARIANT (letters, digits, - and _ only)"; exit 1
+            fi
+            if [[ "$TEST_VARIANT" == "list" ]]; then
+              LIST_ONLY=true
+            elif [[ "$TEST_VARIANT" != "none" ]]; then
+              for D in "${LIST[@]}"; do
+                if [[ ! -d "objectives/$D/tests/$TEST_VARIANT" ]]; then
+                  echo "No test '$TEST_VARIANT' for $D. Available for $D: $(avail "$D")"
+                  exit 1
+                fi
+              done
+            fi
+          fi
+
+          JSON=$(printf '%s\n' "${LIST[@]}" | jq -R . | jq -sc .)
+          echo "Devices: $JSON  list_only=$LIST_ONLY"
+          echo "devices=$JSON" >> "$GITHUB_OUTPUT"
+          echo "list_only=$LIST_ONLY" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.list_only != 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        device: ${{ fromJSON(needs.prepare.outputs.devices) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space (1/3) - System Junk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost /usr/share/swift /usr/local/lib/node_modules
+          sudo rm -rf /usr/local/share/chromium /usr/share/sbt
+          sudo docker image prune --all --force
+          sudo docker builder prune --all --force
+          sudo apt-get clean
+
+      # Pinned to the commit that "main" pointed to when this file was written
+      - name: Free disk space (2/3) - Tool Cache
+        uses: jlumbroso/free-disk-space@cf1e78c50ca91e757bab3edc229027eebfc07871
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Free disk space (3/3)
+        uses: rokibhasansagar/slimhub_actions@c2a6e4317d3de2b623ac7395b05e9d2149e8289b
+        with:
+          retain: 'compiler_cmake'
+
+      - name: Disk Space Check
+        run: df -h /
+
+      - name: Run ReCoreUI Build
+        env:
+          DEVICE: ${{ matrix.device }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
+          RECORE_CHANNEL: ${{ inputs.channel }}
+          RECORE_BUILD_NUMBER: ${{ github.run_number }}
+          RECORE_DEVICE: ${{ matrix.device }}
+          RECORE_OTA_REPO: ${{ vars.OTA_REPO }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEVICE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "Invalid device name: $DEVICE"
+            exit 1
+          fi
+
+          if [[ "$TEST_BUILD" == "true" && "$TEST_VARIANT" != "none" ]]; then
+            echo "TEST BUILD - test: $TEST_VARIANT"
+            SRC="objectives/$DEVICE/tests/$TEST_VARIANT"
+            [[ -d "$SRC" ]] || { echo "Missing test folder: $SRC"; exit 1; }
+
+            # Optional remove.txt inside the test folder: one repo path per line,
+            # deleted before the build (for "build without X" tests). '#' = comment.
+            REMOVE_LIST="$SRC/remove.txt"
+            if [[ -f "$REMOVE_LIST" ]]; then
+              while IFS= read -r P || [[ -n "$P" ]]; do
+                P="${P%$'\r'}"
+                [[ -z "$P" || "$P" == \#* ]] && continue
+                case "$P" in
+                  recore/*|platform/*|objectives/*) ;;
+                  *) echo "remove.txt: path not allowed: $P"; exit 1 ;;
+                esac
+                [[ "$P" == *..* ]] && { echo "remove.txt: '..' not allowed: $P"; exit 1; }
+                [[ -f "$P" ]] || { echo "remove.txt: not a file: $P"; exit 1; }
+                echo "Removing $P"
+                rm -f "$P"
+              done < "$REMOVE_LIST"
+              rm -f "$REMOVE_LIST"
+            fi
+
+            # The rest of the folder (its .sh scripts) becomes active for this build only.
+            mv "$SRC" "objectives/$DEVICE/_active_test"
+          fi
+
+          sudo --preserve-env=RECORE_CHANNEL,RECORE_BUILD_NUMBER,RECORE_DEVICE,RECORE_OTA_REPO bash build.sh --build "$DEVICE"
+
+      # Test scripts may write files to /tmp/test_artifacts (older ones used /tmp/bt_diag
+      # or /tmp/lockstar_diag). Everything found there is attached to the run.
+      - name: Upload test artifacts
+        if: always() && inputs.test_build && inputs.test_variant != 'none' && inputs.test_variant != 'list'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ inputs.test_variant }}-${{ matrix.device }}-${{ github.run_number }}
+          path: |
+            /tmp/test_artifacts
+            /tmp/bt_diag
+            /tmp/lockstar_diag
+          if-no-files-found: ignore
+
+      # Publishes the OTA to a PUBLIC repo (the updater app needs plain download links). The full ROM zip is far
+      # over GitHub's 2 GiB limit, so it is NOT published; only a small delta zip (the changes since the previous
+      # build of this device and channel) and the chunk index of this build's super.img are. The first build of a
+      # channel only publishes the index (the baseline); phones flash its full zip once. Needs the repository
+      # variable OTA_REPO (owner/name) and the secret OTA_REPO_TOKEN. Diagnostic test builds are never published.
+      - name: Set up Go (OTA delta tool)
+        if: inputs.publish_ota == true && (inputs.test_build != true || inputs.test_variant == 'none')
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Publish OTA (delta zip, index and feed)
+        if: inputs.publish_ota == true && (inputs.test_build != true || inputs.test_variant == 'none')
+        env:
+          OTA_REPO: ${{ vars.OTA_REPO }}
+          GH_TOKEN: ${{ secrets.OTA_REPO_TOKEN }}
+          DEVICE: ${{ matrix.device }}
+          CHANNEL: ${{ inputs.channel }}
+          BUILD: ${{ github.run_number }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          : "${OTA_REPO:?Set the repository variable OTA_REPO to the public OTA repo, for example yourname/ReCoreUI-OTA}"
+          : "${GH_TOKEN:?Add the secret OTA_REPO_TOKEN (fine-grained token with Contents: read and write on the OTA repo)}"
+
+          # The disk-cleanup steps above remove the GitHub CLI, so make sure it is there.
+          if ! command -v gh > /dev/null 2>&1; then
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq gh || true
+          fi
+          if ! command -v gh > /dev/null 2>&1; then
+            URL=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | jq -r '.assets[] | select(.name | endswith("linux_amd64.tar.gz")) | .browser_download_url' | head -n 1)
+            [ -n "$URL" ] || { echo "Could not find a GitHub CLI download"; exit 1; }
+            curl -fsSL "$URL" -o /tmp/gh.tar.gz
+            sudo tar -xzf /tmp/gh.tar.gz -C /usr/local --strip-components=1
+          fi
+          gh --version
+
+          ROM_FILE=$(find out -type f -name "*_signed.zip" | head -n 1)
+          if [ -z "$ROM_FILE" ]; then
+            ROM_FILE=$(find out -type f -name "*.zip" | head -n 1)
+          fi
+          [ -n "$ROM_FILE" ] || { echo "No ROM zip found"; exit 1; }
+
+          LOG_TEXT="${CHANGELOG:-}"
+          [ -n "$LOG_TEXT" ] || LOG_TEXT="Build ${BUILD} (${CHANNEL})"
+
+          bash tools/ota/make-delta.sh "$ROM_FILE" "$DEVICE" "$CHANNEL" "$BUILD" "$OTA_REPO" "$LOG_TEXT" ota_out
+
+          TAG="${DEVICE}-${CHANNEL}-${BUILD}"
+          ASSETS=(ota_out/super.idx)
+          shopt -s nullglob
+          for z in ota_out/ReCore-OTA_*.zip; do ASSETS+=("$z"); done
+          shopt -u nullglob
+
+          {
+            echo "$LOG_TEXT"
+            echo
+            echo "type: $(jq -r .type ota_out/feed.json), super sha256: $(jq -r .super_sha256 ota_out/feed.json)"
+          } > notes.md
+
+          PRE=()
+          if [ "$CHANNEL" != "release" ]; then PRE=(--prerelease); fi
+          gh release create "$TAG" "${ASSETS[@]}" --repo "$OTA_REPO" --title "${DEVICE} ${CHANNEL} ${BUILD}" --notes-file notes.md "${PRE[@]}"
+
+          # Rolling release "feed" holds one JSON per device and channel, so the feed URL never changes.
+          FEED="${DEVICE}-${CHANNEL}.json"
+          cp ota_out/feed.json "$FEED"
+          if ! gh release view feed --repo "$OTA_REPO" > /dev/null 2>&1; then
+            gh release create feed --repo "$OTA_REPO" --title "OTA feed" --notes "Rolling update feed. Do not delete." --prerelease
+          fi
+          gh release upload feed "$FEED" --repo "$OTA_REPO" --clobber
+
+          echo "Published $TAG"
+          echo "Feed: https://github.com/${OTA_REPO}/releases/download/feed/${FEED}"
+
+      - name: Upload ROM to Gofile
+        if: inputs.upload_cloud == true
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
+          GOFILE_TEST_FOLDER_ID: ${{ secrets.GOFILE_TEST_FOLDER_ID }}
+          TEST_BUILD: ${{ inputs.test_build }}
+          TEST_VARIANT: ${{ inputs.test_variant }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          echo "Searching for ROM zip..."
+          ROM_FILE=$(find out -type f -name "*_signed.zip" | head -n 1)
+          if [ -z "$ROM_FILE" ]; then
+            ROM_FILE=$(find out -type f -name "*.zip" | head -n 1)
+          fi
+          if [ -z "$ROM_FILE" ]; then
+            echo "No ROM zip found!"
+            exit 1
+          fi
+
+          # Test builds go to a separate Gofile folder and never touch the release folder.
+          if [[ "$TEST_BUILD" == "true" ]]; then
+            if [ -z "${GOFILE_TEST_FOLDER_ID:-}" ]; then
+              echo "GOFILE_TEST_FOLDER_ID secret is not set - refusing to upload a test build to the release folder"
+              exit 1
+            fi
+            UPLOAD_FOLDER_ID="$GOFILE_TEST_FOLDER_ID"
+            TEST_ROM_FILE="${ROM_FILE%.zip}_TEST-${TEST_VARIANT}-${RUN_NUMBER}.zip"
+            mv "$ROM_FILE" "$TEST_ROM_FILE"
+            ROM_FILE="$TEST_ROM_FILE"
+          else
+            UPLOAD_FOLDER_ID="$GOFILE_FOLDER_ID"
+          fi
+
+          echo "Found ROM: $ROM_FILE"
+          ls -lh "$ROM_FILE"
+          sha256sum "$ROM_FILE"
+
+          SERVER=$(curl -sS --fail-with-body --retry 3 https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+          if [ -z "$SERVER" ] || [ "$SERVER" = "null" ]; then
+            echo "Could not get a Gofile server"
+            exit 1
+          fi
+
+          RESPONSE=$(curl -sS --fail-with-body --retry 3 \
+            -H "Authorization: Bearer $GOFILE_TOKEN" \
+            -F "file=@$ROM_FILE" \
+            -F "folderId=$UPLOAD_FOLDER_ID" \
+            "https://$SERVER.gofile.io/uploadFile")
+
+          STATUS=$(echo "$RESPONSE" | jq -r '.status')
+          if [ "$STATUS" != "ok" ]; then
+            echo "Upload failed:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          DOWNLOAD_LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage')
+
+          echo "=============================="
+          echo "Upload Successful!"
+          echo "Download Link: $DOWNLOAD_LINK"
+          echo "=============================="

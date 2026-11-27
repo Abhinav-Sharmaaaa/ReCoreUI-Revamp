@@ -1,6 +1,7 @@
 #This script writes the OTA identity of the ROM into system build.prop.
 #The updater app reads ro.recore.ota.build and ro.recore.ota.channel and compares them with the feed.
-#RECORE_BUILD_NUMBER and RECORE_CHANNEL come from the GitHub workflow (defaults are used for local builds).
+#RECORE_BUILD_NUMBER, RECORE_CHANNEL and RECORE_DEVICE (the objective name) come from the GitHub workflow
+#(defaults are used for local builds). The updater uses ro.recore.ota.device to find its feed file.
 LOG_BEGIN "- Setting OTA properties"
 _OTA_SYS=$(GET_PARTITION_PATH "system") || ERROR_EXIT "ota: system partition not found"
 _OTA_BP="$_OTA_SYS/build.prop"
@@ -22,6 +23,9 @@ _ota_set() {
         printf '\n%s=%s\n' "$key" "$val" >> "$_OTA_BP"
     fi
 }
+_OTA_DEVICE="${RECORE_DEVICE:-}"
+[[ -z "$_OTA_DEVICE" || "$_OTA_DEVICE" =~ ^[A-Za-z0-9_-]+$ ]] || ERROR_EXIT "ota: invalid device name '$_OTA_DEVICE'"
+[[ -z "$_OTA_DEVICE" ]] || _ota_set ro.recore.ota.device "$_OTA_DEVICE"
 _ota_set ro.recore.ota.channel "$_OTA_CHANNEL"
 _ota_set ro.recore.ota.build "$_OTA_BUILD"
 LOG_INFO "channel=$_OTA_CHANNEL build=$_OTA_BUILD"
